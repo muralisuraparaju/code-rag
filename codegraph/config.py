@@ -68,6 +68,13 @@ class AppConfig:
     max_file_size_kb: int        = 500
     workers: int                 = 4    # parallel summarization threads
 
+    # "neo4j" | "memory"
+    graph_backend: str           = "neo4j"
+    # When set, use LocalConnector instead of GitLabConnector
+    local_path: str              = ""
+    # Logical name to tag nodes when using LocalConnector
+    local_repo_name: str         = ""
+
     @classmethod
     def from_env(cls) -> "AppConfig":
         cfg = cls()
@@ -92,4 +99,8 @@ class AppConfig:
         cfg.agent.provider       = os.getenv("AGENT_PROVIDER",  cfg.agent.provider)
         cfg.agent.model          = os.getenv("AGENT_MODEL",     cfg.agent.model)
         cfg.agent.api_key        = os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+        # Source / backend overrides
+        cfg.graph_backend        = os.getenv("GRAPH_BACKEND",    cfg.graph_backend)
+        cfg.local_path           = os.getenv("LOCAL_REPO_PATH",  cfg.local_path)
+        cfg.local_repo_name      = os.getenv("LOCAL_REPO_NAME",  cfg.local_repo_name)
         return cfg

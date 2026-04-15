@@ -1,80 +1,98 @@
 """
 codegraph/pipeline.py
 
-Top-level orchestrator.  Ties together all 6 components:
+Top-level orchestrator.  Wires together all components.
 
-  1. GitLabConnector   — stream files from GitLab
-  2. ParserRegistry    — AST → ModuleNode
-  3. FunctionSummarizer— LLM summaries on each function
-  4. GraphBuilder      — resolve cross-file deps + build edge lists
-  5. Neo4jWriter       — write to graph DB
-  6. CodeGraphRAG      — index for retrieval
-  7. CodeAgent         — answer user questions
+Connector selection (in order of precedence)
+--------------------------------------------
+1. Explicit connector passed to Pipeline(connector=...)
+2. cfg.local_path is set  → LocalConnector
+3. cfg.gitlab.token set   → GitLabConnector
+4. Error
 
-Usage
------
-from codegraph.pipeline import Pipeline
-from codegraph.config import AppConfig
-
-cfg      = AppConfig.from_env()
-pipeline = Pipeline(cfg)
-
-# Build / refresh the graph
-pipeline.build()
-
-# Rebuild vector index (call after build)
-pipeline.index()
-
-# Interactive chat
-agent = pipeline.get_agent()
-while True:
-    q = input("You: ")
-    print("Agent:", agent.chat(q))
+Graph backend selection
+-----------------------
+1. Explicit writer passed to Pipeline(writer=...)
+2. cfg.graph_backend == "memory" → InMemoryWriter
+3. cfg.graph_backend == "neo4j"  → Neo4jWriter (default)
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Union
 
 from codegraph.config import AppConfig
-from codegraph.connectors.gitlab_connector import GitLabConnector
+from codegraph.connectors.local_connector import LocalConnector, BaseConnector
 from codegraph.parsers.ast_parser import get_default_registry
 from codegraph.summarizer.function_summarizer import SummarizerFactory
 from codegraph.graph.graph_builder import GraphBuilder
 from codegraph.graph.neo4j_writer import Neo4jWriter
+from codegraph.graph.memory_writer import InMemoryWriter
 from codegraph.rag.graph_rag import CodeGraphRAG
 from codegraph.agent.code_agent import CodeAgent, BaseAgent
 
 log = logging.getLogger(__name__)
 
+AnyWriter = Union[Neo4jWriter, InMemoryWriter]
+
+
+def _make_connector(cfg: AppConfig) -> BaseConnector:
+    if cfg.local_path:
+        log.info("Using LocalConnector: %s", cfg.local_path)
+        return LocalConnector(
+            root_dir=cfg.local_path,
+            repo_name=cfg.local_repo_name or None,
+        )
+    if cfg.gitlab.token and cfg.gitlab.project:
+        log.info("Using GitLabConnector: %s", cfg.gitlab.project)
+        from codegraph.connectors.gitlab_connector import GitLabConnector
+        return GitLabConnector(cfg.gitlab).connect()
+    raise ValueError(
+        "No source configured. Set cfg.local_path or cfg.gitlab.token+project."
+    )
+
+
+def _make_writer(cfg: AppConfig) -> AnyWriter:
+    if cfg.graph_backend == "memory":
+        log.info("Using InMemoryWriter (no Neo4j required)")
+        return InMemoryWriter()
+    log.info("Using Neo4jWriter: %s", cfg.neo4j.uri)
+    return Neo4jWriter(cfg.neo4j)
+
 
 class Pipeline:
-    def __init__(self, cfg: AppConfig):
-        self._cfg     = cfg
-        self._writer  = Neo4jWriter(cfg.neo4j)
-        self._rag: Optional[CodeGraphRAG] = None
-        self._agent: Optional[BaseAgent]  = None
+    def __init__(
+        self,
+        cfg: AppConfig,
+        connector: Optional[BaseConnector] = None,
+        writer: Optional[AnyWriter] = None,
+    ):
+        self._cfg       = cfg
+        self._connector = connector or _make_connector(cfg)
+        self._writer    = writer    or _make_writer(cfg)
+        self._rag:   Optional[CodeGraphRAG] = None
+        self._agent: Optional[BaseAgent]    = None
 
-    # ------------------------------------------------------------------
-    # Step 1-5: Build the graph from GitLab
-    # ------------------------------------------------------------------
+    @property
+    def writer(self) -> AnyWriter:
+        return self._writer
+
+    @property
+    def connector(self) -> BaseConnector:
+        return self._connector
 
     def build(self, clear: bool = True):
-        """Full pipeline: clone → parse → summarize → write to Neo4j."""
-        cfg = self._cfg
+        cfg       = self._cfg
+        repo_name = self._connector.repo_name
 
-        # Schema + optional wipe
         self._writer.setup_schema()
-
-        connector  = GitLabConnector(cfg.gitlab).connect()
-        repo_name  = connector.repo_name
         if clear:
             self._writer.clear_repo(repo_name)
 
-        parser_reg  = get_default_registry()
-        summarizer  = SummarizerFactory.build(cfg.summarizer)
-        builder     = GraphBuilder(
+        parser_reg = get_default_registry()
+        summarizer = SummarizerFactory.build(cfg.summarizer)
+        builder    = GraphBuilder(
             writer=self._writer,
             summarizer=summarizer,
             summarizer_workers=cfg.workers,
@@ -82,7 +100,7 @@ class Pipeline:
 
         total = parsed = skipped = 0
 
-        for file_entry in connector.iter_files(
+        for file_entry in self._connector.iter_files(
             extensions=cfg.supported_extensions,
             max_size_kb=cfg.max_file_size_kb,
         ):
@@ -90,7 +108,7 @@ class Pipeline:
             try:
                 source = file_entry.content
             except Exception as e:
-                log.warning("Failed to fetch %s: %s", file_entry.path, e)
+                log.warning("Failed to read %s: %s", file_entry.path, e)
                 skipped += 1
                 continue
 
@@ -105,23 +123,17 @@ class Pipeline:
             if parsed % 20 == 0:
                 log.info("Progress: %d / %d files processed", parsed, total)
 
-        log.info("All files fetched. Flushing graph (%d parsed, %d skipped)...", parsed, skipped)
+        log.info(
+            "All files read. Flushing graph (%d parsed, %d skipped / %d total)...",
+            parsed, skipped, total,
+        )
         builder.flush()
         log.info("Graph build complete.")
 
-    # ------------------------------------------------------------------
-    # Step 6: Build vector index
-    # ------------------------------------------------------------------
-
     def index(self):
-        """Populate ChromaDB vector index from current Neo4j contents."""
         rag = self._get_rag()
         rag.index()
         log.info("Vector index built.")
-
-    # ------------------------------------------------------------------
-    # Step 7: Get agent
-    # ------------------------------------------------------------------
 
     def get_agent(self) -> BaseAgent:
         if self._agent is None:
@@ -142,3 +154,14 @@ class Pipeline:
 
     def close(self):
         self._writer.close()
+
+    def print_graph_summary(self):
+        if isinstance(self._writer, InMemoryWriter):
+            self._writer.print_summary()
+        else:
+            rows = self._writer.query(
+                "MATCH (n) RETURN labels(n)[0] AS kind, count(*) AS n ORDER BY n DESC"
+            )
+            print("\n=== Graph node counts ===")
+            for r in rows:
+                print(f"  {r['kind']:15s} {r['n']}")

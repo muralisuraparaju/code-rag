@@ -1,0 +1,23 @@
+# Step 1: verify GitLab credentials (no parsing, no DB)
+python scripts/run.py test-connection --token glpat-xxx --project mygroup/myrepo
+
+# Step 2: parse local files, print per-file results, in-memory only
+python scripts/run.py test-parse --local-path /path/to/repo
+
+# Step 2b: same but limit to 10 files and also write a DOT graph
+python scripts/run.py test-parse --local-path /path/to/repo --max-files 10 --dot out.dot
+
+# Step 3: full build into memory (no Neo4j, no LLM)
+python scripts/run.py build --local-path /path/to/repo --backend memory --summarizer noop
+
+# Step 4: full build into Neo4j with real summaries
+python scripts/run.py build --local-path /path/to/repo --backend neo4j \
+    --neo4j-password pw --summarizer anthropic
+
+# Step 5: chat session (build first, then ask questions)
+python scripts/run.py chat --local-path /path/to/repo --backend memory \
+    --summarizer noop --build
+
+# Step 6: export DOT for visual inspection
+python scripts/run.py export-dot --local-path /path/to/repo --output graph.dot
+dot -Tsvg graph.dot -o graph.svg
