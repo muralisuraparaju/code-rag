@@ -1,0 +1,21 @@
+# Core
+python-gitlab>=4.0
+gitpython>=3.1
+neo4j>=5.0
+
+# AST parsing
+tree-sitter>=0.21
+tree-sitter-languages>=1.10
+
+# LLM summarizer + agent (install at least one)
+anthropic>=0.25       # Claude  — ANTHROPIC_API_KEY
+# openai>=1.0         # GPT-4   — OPENAI_API_KEY
+# httpx>=0.27         # Ollama
+
+# Vector index
+chromadb>=0.5
+# sentence-transformers>=2.0   # local embeddings (no key needed)
+# openai>=1.0                  # OpenAI embeddings
+
+# Utilities
+python-dotenv>=1.0   # load .env file
